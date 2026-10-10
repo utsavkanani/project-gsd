@@ -1,21 +1,24 @@
 # project-gsd skeleton — design
 
 **Date:** 2026-10-10
-**Status:** Draft, awaiting review
+**Status:** Approved
 
 ## Goal
 
-A minimal, reusable template for a Python API service built with Bazel: FastAPI,
-Pydantic, SQLModel and MySQL. It should be small enough to read in one sitting
-and complete enough to clone and run.
+A minimal, reusable template for a Python API service: FastAPI, Pydantic,
+SQLModel and MySQL. It should be small enough to read in one sitting, fast to
+recreate from scratch, and complete enough to clone and run.
+
+No build system beyond `pip` and `pyproject.toml`. Adding a dependency is one
+`pip install`; adding an endpoint is one new file.
 
 ## Success criteria
 
-From a fresh clone, on macOS with Podman and Bazelisk:
+From a fresh clone, on macOS with Python 3.14 and Podman:
 
-1. `bazel test //...` passes without a database running.
-2. `podman compose up -d` starts MySQL. `bazel run //:migrate -- upgrade head` succeeds.
-3. `bazel run //app:server` serves on `localhost:8000`:
+1. `pytest -q` passes without a database running.
+2. `podman compose up -d` starts MySQL.
+3. `uvicorn app.main:app --reload` serves on `localhost:8000`:
    - `GET /health` → `200 {"status": "ok"}`
    - `GET /health/db` → `200 {"status": "ok"}` when MySQL is up, `503` when it's down
    - `GET /docs` shows Swagger UI
@@ -25,78 +28,67 @@ From a fresh clone, on macOS with Podman and Bazelisk:
 
 | Layer | Choice |
 |---|---|
-| Build | Bazel 9.3.0 (bzlmod), rules_python 2.4.2 |
-| Language | Python 3.14 (hermetic toolchain through rules_python) |
+| Language | Python 3.14 |
+| Packaging | `pyproject.toml`, local `.venv`, `pip install -e ".[dev]"` |
 | API | FastAPI 0.143, Uvicorn 0.54 |
 | Validation / config | Pydantic 2.14, pydantic-settings 2.15 |
 | ORM | SQLModel 0.0.48 on async SQLAlchemy 2.1 |
-| MySQL driver | asyncmy 0.2.16 (`mysql+asyncmy://`) |
-| Migrations | Alembic 1.20 |
+| MySQL driver | asyncmy 0.2.16 (`mysql+asyncmy://`), plus `cryptography` for MySQL 8.4's default `caching_sha2_password` auth |
 | Database | MySQL 8.4 LTS, `docker.io/library/mysql:8.4`, run with Podman |
-| Tests | stdlib `unittest` under `bazel test`, with FastAPI `TestClient` (httpx) |
+| Tests | pytest, FastAPI `TestClient` (httpx2, which Starlette now prefers over httpx) |
 
-Python dependencies are declared in `requirements.in` and locked in
-`requirements_lock.txt` by a `compile_pip_requirements` target
-(`bazel run //:requirements.update`). Bazel reads them with `pip.parse`.
+Dependencies in `pyproject.toml` use lower bounds (`>=`) at the versions above.
 
 ## Layout
 
 ```
 project-gsd/
-  MODULE.bazel  .bazelversion  .bazelrc  BUILD.bazel
-  requirements.in  requirements_lock.txt
+  pyproject.toml
   compose.yaml            # MySQL only; works with `podman compose` or `docker compose`
   .env.example  .gitignore  README.md
   app/
-    BUILD.bazel           # py_library //app:lib, py_binary //app:server
-    main.py               # create_app(); the lifespan creates and disposes the engine
+    main.py               # app + lifespan: create tables on startup, dispose engine on shutdown
     settings.py           # Settings(BaseSettings): database_url, from env / .env
     db.py                 # async engine, session factory, get_session() dependency
     routes/health.py      # /health and /health/db
-  migrations/
-    BUILD.bazel           # py_binary wrapping the Alembic CLI, aliased as //:migrate
-    alembic.ini  env.py  script.py.mako  versions/
   tests/
-    BUILD.bazel
     test_health.py
   docs/specs/
 ```
 
 ## Components
 
-- **settings.py:** one `Settings` class. `database_url` is required, so the
-  app fails at startup with a Pydantic validation error if it's missing.
-  Values are read from environment variables and an optional `.env` file.
-  `.env.example` documents them; `.env` is gitignored.
+- **settings.py:** one `Settings` class. `database_url` is read from the
+  environment or an optional `.env` file. Its default points at the local
+  compose MySQL, so the app runs with no config. `.env.example` documents it;
+  `.env` is gitignored.
 - **db.py:** `create_async_engine(settings.database_url, pool_pre_ping=True)`,
   an `async_sessionmaker` producing `sqlmodel.ext.asyncio.session.AsyncSession`,
   and an async `get_session()` generator used as a FastAPI dependency.
-- **main.py:** `create_app()` factory. The lifespan builds the engine on
-  startup and disposes it on shutdown, then mounts the health router.
-  `//app:server` runs Uvicorn on this app.
+  Creating the engine does not connect.
+- **main.py:** the lifespan runs `SQLModel.metadata.create_all` on startup
+  and disposes the engine on shutdown, so startup fails fast if MySQL is
+  unreachable. It mounts the health router.
 - **routes/health.py:** `/health` is liveness only and never touches the DB.
-  `/health/db` runs `SELECT 1` through the session. On any DB error it
+  `/health/db` runs `SELECT 1` through the session. On a database error it
   returns `503 {"status": "unavailable"}` and logs the exception.
-- **migrations:** async `env.py` with `target_metadata = SQLModel.metadata`.
-  `script.py.mako` imports `sqlmodel` so autogenerated revisions work. It
-  reads the URL from `Settings`, never from `alembic.ini`. The skeleton ships
-  no tables, so the first revision is empty.
+
+## Schema changes
+
+The skeleton uses `create_all`, which creates missing tables but never alters
+existing ones. Add Alembic once the schema needs to evolve with data in place.
 
 ## Testing
 
-`tests/test_health.py` uses `unittest.TestCase` with `TestClient(create_app())`.
-`get_session` is overridden with a fake, so no MySQL is needed:
+`tests/test_health.py` uses `TestClient` with `get_session` overridden by a
+fake, and the startup table creation disabled, so no MySQL is needed:
 
 - `/health` returns 200.
-- `/health/db` returns 200 when the fake session's `exec` succeeds.
+- `/health/db` returns 200 when the fake session succeeds.
 - `/health/db` returns 503 when the fake raises `OperationalError`.
-
-The test target sets a dummy `DATABASE_URL` in `env`, so `Settings` validates
-without a real database. The engine is created lazily and never connects
-during tests.
 
 ## Out of scope (possible later additions)
 
-Domain models and CRUD, container image (rules_oci), Kubernetes manifests,
-CI (GitHub Actions), auth, structured logging, integration tests against a
-real MySQL, linting and formatting targets.
+Domain models and CRUD, Alembic migrations, container image, Kubernetes
+manifests, CI, auth, structured logging, integration tests against a real
+MySQL, linting and formatting.
